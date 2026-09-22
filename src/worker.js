@@ -386,6 +386,254 @@ async function resolveCreatedBugId(env, user, productID, title) {
 }
 
 // ---------------------------------------------------------------------------
+// State actions + notification support layer.
+// API facts verified live against ZenTao 21.7 (2026-09-22):
+//   Task:  finish   POST /tasks/{id}/finish  {realStarted, finishedDate, currentConsumed, comment}
+//                     — realStarted/finishedDate required; currentConsumed required
+//                       when total consumed would be 0 ("总计消耗为0时不能完成任务")
+//          close    POST /tasks/{id}/close   {comment}  — works from wait/done/cancel
+//          cancel   WEB  POST /task-cancel-{id}.html   {comment}
+//                     (REST /tasks/{id}/cancel = 404; PUT {status:'cancel'} works but
+//                      records only "edited" and loses the comment)
+//          activate WEB  POST /task-activate-{id}.html {comment, status:'wait', assignedTo, left}
+//                     (closed → activate via PUT {status:'wait', assignedTo, left, closedReason:''})
+//   Bug:   resolve  POST /bugs/{id}/resolve  {resolution, resolvedBuild, assignedTo, comment}
+//                     — resolvedBuild required; resolution is NOT validated server-side
+//                       (garbage is accepted), so we whitelist the real enum ourselves:
+//                       bydesign/duplicate/external/fixed/notrepro/postponed/willnotfix
+//          close    POST /bugs/{id}/close    {comment}  — works from active AND resolved
+//          activate WEB  POST /bug-activate-{id}.html
+//                     {comment, openedBuild, assignedTo, resolution:'', resolvedBuild:''}
+//                     — openedBuild required; empty resolution/resolvedBuild clear the
+//                       old values (works from resolved AND closed)
+//          cancel:  DOES NOT EXIST (REST 404 twice, no canceled status) — never faked;
+//                   map 不做/重复/设计如此 to resolve_bug resolution.
+//   Readback + actions[] verification is mandatory on every action: several routes
+//   answer HTTP 200 with an empty body and change nothing (fake success).
+// ---------------------------------------------------------------------------
+
+const RESOLUTIONS = ['bydesign', 'duplicate', 'external', 'fixed', 'notrepro', 'postponed', 'willnotfix'];
+const RESOLUTION_LABELS = {
+  bydesign: '设计如此', duplicate: '重复Bug', external: '外部原因', fixed: '已解决',
+  notrepro: '无法重现', postponed: '延期处理', willnotfix: '不予解决',
+};
+const NOTIFY_EVENTS = ['assigned', 'reassigned', 'finished', 'closed', 'canceled', 'activated'];
+
+function nowCN() {
+  return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 19).replace('T', ' ');
+}
+function accOf(v) {
+  return typeof v === 'object' && v !== null ? (v.account ?? null) : (v || null);
+}
+function realnameOf(v) {
+  return typeof v === 'object' && v !== null ? (v.realname ?? '') : '';
+}
+function objectUrl(env, objectType, id) {
+  return W_BASE(env) + (objectType === 'bug' ? `/bug-view-${id}.html` : `/task-view-${id}.html`);
+}
+function notificationKey(objectType, objectID, event, account) {
+  return `${objectType}:${objectID}:${event}:${account}`;
+}
+function parseNotificationKey(key) {
+  const m = /^(bug|task):(\d+):(assigned|reassigned|finished|closed|canceled|activated):([A-Za-z0-9_.-]+)$/.exec(String(key || ''));
+  return m ? { objectType: m[1], objectID: Number(m[2]), event: m[3], account: m[4] } : null;
+}
+// event 未传时按对象当前状态推导默认事件。
+function defaultEvent(objectType, obj) {
+  const s = obj?.status;
+  if (objectType === 'bug') {
+    return s === 'resolved' ? 'finished' : s === 'closed' ? 'closed' : 'assigned';
+  }
+  return s === 'done' ? 'finished' : s === 'closed' ? 'closed' : s === 'cancel' ? 'canceled' : 'assigned';
+}
+
+// 联系人配置：ZT_CONTACTS env JSON（最简可靠）。禅道用户 email 非空时优先用禅道的。
+// { "wanganqing": {"realname":"王安庆","email":"...","enabled":true}, ... }
+function contactConfig(env) {
+  try {
+    const raw = JSON.parse(env.ZT_CONTACTS || '{}');
+    const out = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (!v || typeof v !== 'object') continue;
+      const email = typeof v.email === 'string' && v.email.includes('@') ? v.email : null;
+      out[String(k).toLowerCase()] = {
+        realname: v.realname ?? '',
+        email,
+        enabled: v.enabled !== false,
+      };
+    }
+    return out;
+  } catch { return {}; }
+}
+
+function usersRows(data) {
+  if (Array.isArray(data)) return data;
+  const inner = data?.data;
+  if (Array.isArray(inner)) return inner;
+  if (Array.isArray(inner?.users)) return inner.users;
+  return data?.users || data?.list || [];
+}
+
+async function findUserRow(env, user, account) {
+  const res = await ztFetch(env, user, '/users', { query: { limit: 100 } });
+  if (!res.ok) return null;
+  const rows = usersRows(res.data);
+  const want = String(account).toLowerCase();
+  return rows.find((r) => String(r.account).toLowerCase() === want) || null;
+}
+
+// get_user_contact 的核心：禅道 email 优先，其次 ZT_CONTACTS，绝不猜邮箱。
+async function resolveContact(env, user, account) {
+  const row = await findUserRow(env, user, account);
+  if (!row) return { error: 'USER_NOT_FOUND', account };
+  const cfg = contactConfig(env)[String(account).toLowerCase()] || {};
+  const ztEmail = typeof row.email === 'string' && row.email.includes('@') ? row.email : null;
+  const cfgEmail = cfg.enabled === false ? null : cfg.email;
+  const email = ztEmail ?? cfgEmail ?? null;
+  if (!email) {
+    return { account: row.account ?? account, realname: row.realname || cfg.realname || '', email: null, emailEnabled: false, reason: 'NO_EMAIL_CONFIGURED' };
+  }
+  return { account: row.account ?? account, realname: row.realname || cfg.realname || '', email, emailEnabled: true, source: ztEmail ? 'zentao' : 'notification_config' };
+}
+
+// 通知台账：ZT_USERS KV，key = notification:{notificationKey}，跨请求/跨 isolate 持久。
+// isolate 内读己之写缓存（Map，随 isolate 存亡）：KV 读对「不存在」有约 60s 边缘负缓存，
+// 刚写入的台账在同 isolate 随后读取可能拿到旧的 null —— 那会绕过 NOTIFICATION_ALREADY_RECORDED
+// 幂等分支、真实重复发邮件（2026-09-22 回归实测踩坑）。缓存只加速读，正确性始终以 KV 为准。
+const notifMem = new Map(); // notificationKey -> record | null
+async function notifGet(env, key) {
+  if (!env.ZT_USERS) return null;
+  if (notifMem.has(key)) return notifMem.get(key);
+  try {
+    const raw = await env.ZT_USERS.get('notification:' + key);
+    const rec = raw ? JSON.parse(raw) : null;
+    notifMem.set(key, rec);
+    return rec;
+  } catch (err) {
+    // 台账读取失败必须报出来，绝不静默当成「未发送」——那是重复发邮件的根源
+    throw new Error(`通知台账读取失败（${err?.message ?? err}），无法确认是否已发送，本次操作结果未确认`);
+  }
+}
+async function notifPut(env, key, record) {
+  if (!env.ZT_USERS) throw new Error('通知台账需要 ZT_USERS KV 绑定（wrangler.jsonc kv_namespaces）');
+  await env.ZT_USERS.put('notification:' + key, JSON.stringify(record));
+  notifMem.set(key, record);
+}
+
+// 禅道对象提取：形状无关 + 按 id 校验。绝不能写 `data?.task ?? data` —— Bug 对象
+// 顶层带整数字段 task:0（关联任务 ID），`??` 遇 0 不回退，会把数字 0 当成对象，
+// 导致 id 匹配永远失败、假报 NOT_FOUND（2026-09-22 实测踩坑）。
+function pickObj(data, id) {
+  if (!data || typeof data !== 'object') return null;
+  for (const key of ['bug', 'task', 'story', 'execution', 'project', 'product']) {
+    const v = data[key];
+    if (v && typeof v === 'object' && (id === undefined || Number(v.id) === Number(id))) return v;
+  }
+  if (data.id !== undefined && (id === undefined || Number(data.id) === Number(id))) return data;
+  return null;
+}
+
+async function readObject(env, user, objectType, id) {
+  const res = await ztFetch(env, user, `/${objectType === 'bug' ? 'bugs' : 'tasks'}/${id}`);
+  // 源站 5xx / HTML 错误页不是"对象不存在"——绝不能误报 NOT_FOUND（2026-09-22 实测：
+  // 源站抖动时 520 会让"Bug 还在却报不存在"，上层可能据此做出错误结论）。
+  if (res.status >= 500 || res.data?.nonJsonResponse) {
+    throw new Error(`禅道源站异常（HTTP ${res.status}），无法读取 ${objectType} ${id}，本次操作结果未确认，请稍后用 get_${objectType} 回读核实`);
+  }
+  const obj = pickObj(res.data, id);
+  return { res, obj: res.ok && obj && Number(obj.id) === Number(id) ? obj : null };
+}
+
+function hasAction(obj, action) {
+  return (obj?.actions || []).some((x) => x.action === action);
+}
+function actionEntry(obj, action) {
+  return [...(obj?.actions || [])].reverse().find((x) => x.action === action) || null;
+}
+
+// 状态动作统一收口：校验清单 -> 不通过报 ACTION_NOT_APPLIED（绝不假成功）。
+// actor 字段（finishedBy/closedBy/...）若被服务端写入则必须等于当前连接器账号。
+function verifyAction(obj, { status, actorField, action, comment }, user) {
+  const problems = [];
+  if (status && obj.status !== status) problems.push(`status 回读为 ${obj.status}（期望 ${status}）`);
+  if (action && !hasAction(obj, action)) problems.push(`动作历史缺少 ${action} 记录`);
+  if (actorField) {
+    const actor = accOf(obj[actorField]);
+    if (actor && actor !== user.account) problems.push(`${actorField}=${actor}（期望 ${user.account}）`);
+    if (!actor) problems.push(`${actorField} 未写入`);
+  }
+  if (comment !== undefined && comment !== null && String(comment).trim()) {
+    const entry = action && actionEntry(obj, action);
+    if (entry && String(entry.comment ?? '').trim() !== String(comment).trim()) {
+      problems.push(`动作备注未保存（回读 ${JSON.stringify(entry.comment ?? '')}）`);
+    }
+  }
+  return problems;
+}
+
+function actionSummary(objectType, obj) {
+  const base = {
+    id: obj.id,
+    title: objectType === 'bug' ? obj.title : obj.name,
+    status: obj.status,
+    assignedTo: accOf(obj.assignedTo),
+    assignedToRealName: realnameOf(obj.assignedTo),
+  };
+  if (objectType === 'bug') {
+    return { ...base, resolution: obj.resolution, resolvedBy: accOf(obj.resolvedBy), closedBy: accOf(obj.closedBy),
+      resolvedDate: obj.resolvedDate, closedDate: obj.closedDate, activatedCount: obj.activatedCount };
+  }
+  return { ...base, finishedBy: accOf(obj.finishedBy), closedBy: accOf(obj.closedBy), canceledBy: accOf(obj.canceledBy),
+    finishedDate: obj.finishedDate, closedDate: obj.closedDate, canceledDate: obj.canceledDate,
+    consumed: obj.consumed, left: obj.left };
+}
+
+function actionResult(env, objectType, obj, event) {
+  const acc = accOf(obj.assignedTo);
+  const key = acc ? notificationKey(objectType, obj.id, event, acc) : null;
+  return {
+    status: 200,
+    ok: true,
+    data: {
+      success: true,
+      [objectType]: actionSummary(objectType, obj),
+      notificationKeySuggestion: key,
+      notificationHint: key
+        ? `如需通知：get_notification_context(objectType="${objectType}", objectID=${obj.id}, event="${event}") → get_notification_status → 由 ChatGPT 判断并经 Gmail 发送 → record_notification`
+        : '该对象当前无负责人，无可通知对象',
+    },
+  };
+}
+
+// 创建/修改类返回里的通知提示字段（与 actionResult 保持同一约定）。
+function notifHint(objectType, id, event, acc) {
+  const key = acc ? notificationKey(objectType, id, event, acc) : null;
+  return {
+    notificationKeySuggestion: key,
+    notificationHint: key
+      ? `如需通知：get_notification_context(objectType="${objectType}", objectID=${id}, event="${event}") → get_notification_status → 由 ChatGPT 判断并经 Gmail 发送 → record_notification`
+      : '该对象当前无负责人，无可通知对象',
+  };
+}
+
+// 网页表单动作（保留空字符串值：bug-activate 需要 resolution:''/resolvedBuild:'' 来清空旧值）。
+async function webFormPost(env, user, path, fields) {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue;
+    body.append(k, String(v));
+  }
+  const res = await webFetch(env, user, path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  let data;
+  try { data = JSON.parse(res.text); } catch { data = { result: 'fail', message: '网页保存响应异常: ' + res.text.slice(0, 150) }; }
+  return { status: res.status, ok: data.result !== 'fail' && !data.error, data };
+}
+
+// ---------------------------------------------------------------------------
 
 const pager = {
   limit: { type: 'integer', description: '每页条数，默认 20，最大 100' },
@@ -614,7 +862,7 @@ const TOOLS = [
           return { status: 500, ok: false, data: { reason: 'Bug 已创建但无法定位新 Bug ID，请在禅道网页确认', imageFailures: failures } };
         }
         const rb = await ztFetch(env, user, `/bugs/${bugId}`);
-        const bug = rb.data?.bug ?? rb.data;
+        const bug = pickObj(rb.data, bugId);
         const acc = typeof bug?.assignedTo === 'object' ? bug?.assignedTo?.account : bug?.assignedTo;
         const fieldsOk = bug && Number(bug.product) === Number(a.productID) &&
           Number(bug.project) === Number(projectID) && bug.title === title && acc === a.assignedTo;
@@ -647,6 +895,7 @@ const TOOLS = [
             embedded: imagesInSteps.length,
             failed: failures,
           },
+          ...notifHint('bug', bug.id, 'assigned', acc),
           note: `openedBy 为当前连接器账号 ${user.account}：禅道以 API 登录账号记录创建人，不允许代他人提交。`,
         };
         if (failures.length || imagesInSteps.length < uploaded.length) {
@@ -683,7 +932,7 @@ const TOOLS = [
       // Readback: the server silently drops invalid assignedTo accounts, so a
       // 2xx response proves nothing — verify what actually persisted.
       const rb = await ztFetch(env, user, `/bugs/${bugId}`);
-      const bug = rb.data?.bug ?? rb.data;
+      const bug = pickObj(rb.data, bugId);
       const acc = typeof bug?.assignedTo === 'object' ? bug?.assignedTo?.account : bug?.assignedTo;
       const verified =
         bug && Number(bug.product) === Number(a.productID) && Number(bug.project) === Number(projectID) &&
@@ -723,6 +972,7 @@ const TOOLS = [
             type: bug.type,
             status: bug.status,
           },
+          ...notifHint('bug', bug.id, 'assigned', acc),
           note: `openedBy 为当前连接器账号 ${user.account}：禅道以 API 登录账号记录创建人，不允许代他人提交。`,
         },
       };
@@ -765,7 +1015,7 @@ const TOOLS = [
       // Images → web-form edit flow (v1 API would strip the <img> tags).
       if (Array.isArray(a.images) && a.images.length > 0) {
         const cur = await ztFetch(env, user, `/bugs/${a.id}`);
-        const curBug = cur.data?.bug ?? cur.data;
+        const curBug = pickObj(cur.data, a.id);
         if (!curBug?.id || cur.data?.error) {
           return { status: cur.status, ok: false, data: { error: `Bug ${a.id} 不存在或无法访问` } };
         }
@@ -791,7 +1041,7 @@ const TOOLS = [
           return { status: 500, ok: false, data: { zentaoError: save.data, stage: 'web-edit', note: '网页保存失败，Bug 未被改动' } };
         }
         const rb = await ztFetch(env, user, `/bugs/${a.id}`);
-        const bug = rb.data?.bug ?? rb.data;
+        const bug = pickObj(rb.data, a.id);
         const acc = typeof bug?.assignedTo === 'object' ? bug?.assignedTo?.account : bug?.assignedTo;
         const problems = [];
         const wantAssignee = a.assignedTo ?? (typeof curBug.assignedTo === 'object' ? curBug.assignedTo?.account : curBug.assignedTo);
@@ -811,6 +1061,7 @@ const TOOLS = [
           bug: { id: bug.id, title: bug.title, product: bug.product, project: bug.project, execution: bug.execution,
                  assignedTo: acc, assignedToRealName: bug.assignedTo?.realname ?? '', status: bug.status },
           images: { requested: a.images.length, uploaded: uploaded.length, embedded: imagesInSteps.length, failed: failures },
+          ...(a.assignedTo && a.assignedTo !== accOf(curBug.assignedTo) ? notifHint('bug', bug.id, 'reassigned', acc) : {}),
         };
         if (failures.length || imagesInSteps.length < uploaded.length) {
           return { status: 200, ok: false, data: { ...base, code: 'BUG_CREATED_IMAGE_FAILED', reason: 'Bug 已更新但部分图片未成功内嵌，见 images' } };
@@ -838,7 +1089,7 @@ const TOOLS = [
       }
       // Readback: verify the silent-drop-prone fields actually persisted.
       const rb = await ztFetch(env, user, `/bugs/${a.id}`);
-      const bug = rb.data?.bug ?? rb.data;
+      const bug = pickObj(rb.data, a.id);
       const problems = [];
       if (body.assignedTo !== undefined) {
         const acc = typeof bug?.assignedTo === 'object' ? bug?.assignedTo?.account : bug?.assignedTo;
@@ -876,6 +1127,7 @@ const TOOLS = [
             type: bug.type,
             status: bug.status,
           },
+          ...(body.assignedTo !== undefined ? notifHint('bug', bug.id, 'reassigned', acc2) : {}),
         },
       };
     },
@@ -1013,9 +1265,32 @@ const TOOLS = [
       },
       required: ['id'],
     },
-    run: (env, user, a) => {
+    run: async (env, user, a) => {
       const { id, ...body } = a;
-      return ztFetch(env, user, `/tasks/${id}`, { method: 'PUT', body });
+      const res = await ztFetch(env, user, `/tasks/${id}`, { method: 'PUT', body });
+      if (!res.ok || res.data?.error || res.data?.result === 'fail') {
+        return { status: res.status, ok: false, data: { zentaoError: res.data } };
+      }
+      // Readback: 禅道对无效 assignedTo 静默丢弃（HTTP 200），必须回读核对。
+      const rb = await ztFetch(env, user, `/tasks/${id}`);
+      const task = pickObj(rb.data, id);
+      const problems = [];
+      if (body.assignedTo !== undefined && body.assignedTo !== null && body.assignedTo !== '') {
+        const acc = accOf(task?.assignedTo);
+        if (acc !== body.assignedTo) problems.push(`assignedTo 回读为 ${acc ?? 'null'}（期望 ${body.assignedTo}）`);
+      }
+      if (problems.length) {
+        return {
+          status: 200,
+          ok: false,
+          data: {
+            code: 'ACTION_NOT_APPLIED',
+            reason: `修改未生效：${problems.join('；')}。常见原因是 assignedTo 不是有效的禅道账号，请用 list_users 核对。`,
+            readback: { assignedTo: task?.assignedTo ?? null, status: task?.status },
+          },
+        };
+      }
+      return { status: 200, ok: true, data: { success: true, task: actionSummary('task', task) } };
     },
   },
   {
@@ -1067,6 +1342,483 @@ const TOOLS = [
       return ztFetch(env, user, `/executions/${id}`, { method: 'PUT', body });
     },
   },
+  // -------------------------------------------------------------------------
+  // Task 状态动作（真实动作 API，全部回读 + 动作历史校验）
+  // -------------------------------------------------------------------------
+  {
+    name: 'finish_task',
+    title: '完成任务',
+    description:
+      '完成任务（状态 wait/doing → done）。服务端要求填写实际开始/实际完成时间，未传时自动填当前时间；' +
+      '本次消耗工时 currentConsumed 在总消耗为 0 时必填，默认 1。完成后 assignedTo 不变、finishedBy 自动为当前账号。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: '任务 ID' },
+        consumed: { type: 'number', description: '本次消耗工时（小时），默认 1；总消耗为 0 时服务端必填' },
+        realStarted: { type: 'string', description: '实际开始时间 YYYY-MM-DD HH:MM:SS，默认当前时间' },
+        finishedDate: { type: 'string', description: '实际完成时间 YYYY-MM-DD HH:MM:SS，默认当前时间' },
+        comment: { type: 'string', description: '完成备注（写入动作历史）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'task', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `任务 ${a.id} 不存在或无法访问` } };
+      const cur = before.obj.status;
+      if (cur === 'done') return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `任务 ${a.id} 已是 done 状态，无需重复完成`, task: actionSummary('task', before.obj) } };
+      if (cur === 'closed' || cur === 'cancel') return { status: 400, ok: false, data: { code: 'INVALID_TRANSITION', reason: `${cur} 状态的任务不能直接完成；如需继续请先 activate_task 激活` } };
+      const consumed = Number(a.consumed ?? 1);
+      const save = await ztFetch(env, user, `/tasks/${a.id}/finish`, {
+        method: 'POST',
+        body: {
+          realStarted: a.realStarted ?? nowCN(),
+          finishedDate: a.finishedDate ?? nowCN(),
+          currentConsumed: consumed,
+          comment: a.comment ?? '',
+        },
+      });
+      if (!save.ok || save.data?.error || save.data?.result === 'fail') {
+        return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      }
+      const after = await readObject(env, user, 'task', a.id);
+      const obj = after.obj ?? pickObj(save.data, a.id) ?? save.data ?? {};
+      const problems = verifyAction(obj, { status: 'done', actorField: 'finishedBy', action: 'finished', comment: a.comment }, user);
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '完成任务未生效：' + problems.join('；'), readback: actionSummary('task', obj) } };
+      }
+      return actionResult(env, 'task', obj, 'finished');
+    },
+  },
+  {
+    name: 'close_task',
+    title: '关闭任务',
+    description:
+      '关闭任务（→ closed）。wait/done/cancel 状态均可直接关闭（实测允许）；closedBy 自动为当前账号。' +
+      '重复关闭同一任务会稳定返回 ACTION_ALREADY_IN_STATE 并保持幂等、不产生新动作记录。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: '任务 ID' },
+        comment: { type: 'string', description: '关闭原因/备注（写入动作历史，建议写明原因，如与某任务重复）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'task', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `任务 ${a.id} 不存在或无法访问` } };
+      if (before.obj.status === 'closed') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `任务 ${a.id} 已是 closed 状态，无需重复关闭`, task: actionSummary('task', before.obj) } };
+      }
+      const save = await ztFetch(env, user, `/tasks/${a.id}/close`, { method: 'POST', body: { comment: a.comment ?? '' } });
+      if (!save.ok || save.data?.error || save.data?.result === 'fail') {
+        return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      }
+      const after = await readObject(env, user, 'task', a.id);
+      const obj = after.obj ?? pickObj(save.data, a.id) ?? save.data ?? {};
+      const problems = verifyAction(obj, { status: 'closed', actorField: 'closedBy', action: 'closed', comment: a.comment }, user);
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '关闭任务未生效：' + problems.join('；'), readback: actionSummary('task', obj) } };
+      }
+      return actionResult(env, 'task', obj, 'closed');
+    },
+  },
+  {
+    name: 'cancel_task',
+    title: '取消任务',
+    description:
+      '取消任务（→ cancel）。走禅道网页真实取消动作（canceledBy/canceledDate 自动写入，备注进动作历史）；' +
+      'REST 无此路由。已取消再调用返回 ACTION_ALREADY_IN_STATE（幂等）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: '任务 ID' },
+        comment: { type: 'string', description: '取消原因（写入动作历史）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'task', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `任务 ${a.id} 不存在或无法访问` } };
+      if (before.obj.status === 'cancel') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `任务 ${a.id} 已是 cancel 状态`, task: actionSummary('task', before.obj) } };
+      }
+      if (before.obj.status === 'closed') return { status: 400, ok: false, data: { code: 'INVALID_TRANSITION', reason: 'closed 状态的任务不能再取消；如需变更请先 activate_task' } };
+      const save = await webFormPost(env, user, `/task-cancel-${a.id}.html`, { comment: a.comment ?? '' });
+      if (!save.ok) return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      const after = await readObject(env, user, 'task', a.id);
+      const obj = after.obj ?? before.obj;
+      const problems = verifyAction(obj, { status: 'cancel', actorField: 'canceledBy', action: 'canceled', comment: a.comment }, user);
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '取消任务未生效：' + problems.join('；'), readback: actionSummary('task', obj) } };
+      }
+      return actionResult(env, 'task', obj, 'canceled');
+    },
+  },
+  {
+    name: 'activate_task',
+    title: '激活任务',
+    description:
+      '重新激活任务（cancel/closed → wait）。取消态走网页激活动作（activated 备注进动作历史）；' +
+      'closed 态按禅道规则需清空 closedReason 后回到 wait。可同时改派 assignedTo 和剩余工时 left。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: '任务 ID' },
+        assignedTo: { type: 'string', description: '改派给（禅道账号），不传保持原负责人' },
+        left: { type: 'number', description: '剩余工时（小时）' },
+        comment: { type: 'string', description: '激活原因（写入动作历史）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'task', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `任务 ${a.id} 不存在或无法访问` } };
+      const src = before.obj;
+      if (src.status === 'wait' || src.status === 'doing') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `任务 ${a.id} 已是 ${src.status} 状态，无需激活`, task: actionSummary('task', src) } };
+      }
+      const assignedTo = a.assignedTo ?? accOf(src.assignedTo) ?? user.account;
+      const left = a.left ?? (Number(src.left) > 0 ? Number(src.left) : 8);
+      let save;
+      if (src.status === 'closed') {
+        save = await ztFetch(env, user, `/tasks/${a.id}`, {
+          method: 'PUT',
+          body: { status: 'wait', assignedTo, left, closedReason: '' },
+        });
+      } else {
+        save = await webFormPost(env, user, `/task-activate-${a.id}.html`, {
+          comment: a.comment ?? '', status: 'wait', assignedTo, left,
+        });
+      }
+      if (!save.ok || save.data?.error || save.data?.result === 'fail') {
+        return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      }
+      const after = await readObject(env, user, 'task', a.id);
+      const obj = after.obj ?? src;
+      const problems = [];
+      if (obj.status !== 'wait') problems.push(`status 回读为 ${obj.status}（期望 wait）`);
+      if (accOf(obj.assignedTo) !== assignedTo) problems.push(`assignedTo 回读为 ${accOf(obj.assignedTo) ?? 'null'}（期望 ${assignedTo}）`);
+      if (a.comment && String(a.comment).trim() && src.status !== 'closed' && !hasAction(obj, 'activated')) {
+        problems.push('动作历史缺少 activated 记录');
+      }
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '激活任务未生效：' + problems.join('；'), readback: actionSummary('task', obj) } };
+      }
+      return actionResult(env, 'task', obj, a.assignedTo && accOf(src.assignedTo) !== a.assignedTo ? 'reassigned' : 'activated');
+    },
+  },
+  // -------------------------------------------------------------------------
+  // Bug 状态动作（真实动作 API；cancel 不存在，绝不伪造）
+  // -------------------------------------------------------------------------
+  {
+    name: 'resolve_bug',
+    title: '解决 Bug',
+    description:
+      '解决 Bug（active → resolved）。resolution 必填且限定禅道真实枚举：' +
+      RESOLUTIONS.map((r) => `${r} ${RESOLUTION_LABELS[r]}`).join(' / ') +
+      '。resolvedBuild 解决版本必填（默认 trunk）。取消/不做/重复类诉求请用本工具（willnotfix/duplicate/bydesign 等）——禅道 Bug 没有 canceled 状态。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: 'Bug ID' },
+        resolution: { type: 'string', description: '解决方案：' + RESOLUTIONS.join(' / ') },
+        resolvedBuild: { type: 'string', description: '解决版本，默认 trunk' },
+        assignedTo: { type: 'string', description: '解决后回指给（禅道账号，通常给提 Bug 的人验证），不传保持不变' },
+        comment: { type: 'string', description: '解决说明（写入动作历史）' },
+      },
+      required: ['id', 'resolution'],
+    },
+    run: async (env, user, a) => {
+      const resolution = String(a.resolution || '').trim().toLowerCase();
+      if (!RESOLUTIONS.includes(resolution)) {
+        return {
+          status: 400, ok: false,
+          data: { code: 'INVALID_RESOLUTION', reason: `resolution=${a.resolution} 不是禅道真实解决方案枚举`, allowed: RESOLUTIONS, labels: RESOLUTION_LABELS },
+        };
+      }
+      const before = await readObject(env, user, 'bug', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `Bug ${a.id} 不存在或无法访问` } };
+      if (before.obj.status === 'resolved') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `Bug ${a.id} 已是 resolved 状态`, bug: actionSummary('bug', before.obj) } };
+      }
+      if (before.obj.status === 'closed') return { status: 400, ok: false, data: { code: 'INVALID_TRANSITION', reason: 'closed 状态的 Bug 不能直接解决；如需变更请先 activate_bug 激活' } };
+      const save = await ztFetch(env, user, `/bugs/${a.id}/resolve`, {
+        method: 'POST',
+        body: { resolution, resolvedBuild: a.resolvedBuild ?? 'trunk', assignedTo: a.assignedTo, comment: a.comment ?? '' },
+      });
+      if (!save.ok || save.data?.error || save.data?.result === 'fail') {
+        return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      }
+      const after = await readObject(env, user, 'bug', a.id);
+      const obj = after.obj ?? pickObj(save.data, a.id) ?? save.data ?? {};
+      const problems = verifyAction(obj, { status: 'resolved', actorField: 'resolvedBy', action: 'resolved', comment: a.comment }, user);
+      if (obj.resolution !== resolution) problems.push(`resolution 回读为 ${JSON.stringify(obj.resolution)}（期望 ${resolution}）`);
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '解决 Bug 未生效：' + problems.join('；'), readback: actionSummary('bug', obj) } };
+      }
+      return actionResult(env, 'bug', obj, 'finished');
+    },
+  },
+  {
+    name: 'close_bug',
+    title: '关闭 Bug',
+    description:
+      '关闭 Bug（→ closed）。active 和 resolved 均可直接关闭（实测允许）；closedBy 自动为当前账号。' +
+      '重复关闭返回 ACTION_ALREADY_IN_STATE（幂等）。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: 'Bug ID' },
+        comment: { type: 'string', description: '关闭备注（写入动作历史）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'bug', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `Bug ${a.id} 不存在或无法访问` } };
+      if (before.obj.status === 'closed') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `Bug ${a.id} 已是 closed 状态，无需重复关闭`, bug: actionSummary('bug', before.obj) } };
+      }
+      const save = await ztFetch(env, user, `/bugs/${a.id}/close`, { method: 'POST', body: { comment: a.comment ?? '' } });
+      if (!save.ok || save.data?.error || save.data?.result === 'fail') {
+        return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      }
+      const after = await readObject(env, user, 'bug', a.id);
+      const obj = after.obj ?? pickObj(save.data, a.id) ?? save.data ?? {};
+      const problems = verifyAction(obj, { status: 'closed', actorField: 'closedBy', action: 'closed', comment: a.comment }, user);
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '关闭 Bug 未生效：' + problems.join('；'), readback: actionSummary('bug', obj) } };
+      }
+      return actionResult(env, 'bug', obj, 'closed');
+    },
+  },
+  {
+    name: 'activate_bug',
+    title: '激活 Bug',
+    description:
+      '重新激活 Bug（resolved/closed → active，走禅道网页真实激活动作，activatedCount+1，' +
+      '旧的 resolution/resolvedBuild 自动清空）。可同时改派 assignedTo。' +
+      '注意：禅道 Bug 没有 canceled 状态、也没有 cancel 动作。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'integer', description: 'Bug ID' },
+        assignedTo: { type: 'string', description: '改派给（禅道账号），不传保持原负责人' },
+        comment: { type: 'string', description: '激活原因（写入动作历史）' },
+      },
+      required: ['id'],
+    },
+    run: async (env, user, a) => {
+      const before = await readObject(env, user, 'bug', a.id);
+      if (!before.obj) return { status: before.res.status, ok: false, data: { code: 'NOT_FOUND', reason: `Bug ${a.id} 不存在或无法访问` } };
+      const src = before.obj;
+      if (src.status === 'active') {
+        return { status: 200, ok: true, data: { code: 'ACTION_ALREADY_IN_STATE', reason: `Bug ${a.id} 已是 active 状态，无需激活`, bug: actionSummary('bug', src) } };
+      }
+      const openedBuild = Array.isArray(src.openedBuild) && src.openedBuild.length
+        ? String(src.openedBuild[0].id ?? src.openedBuild[0] ?? 'trunk')
+        : String(src.openedBuild || 'trunk');
+      const save = await webFormPost(env, user, `/bug-activate-${a.id}.html`, {
+        comment: a.comment ?? '',
+        openedBuild,
+        assignedTo: a.assignedTo ?? accOf(src.assignedTo) ?? user.account,
+        resolution: '',
+        resolvedBuild: '',
+      });
+      if (!save.ok) return { status: save.status, ok: false, data: { zentaoError: save.data } };
+      const after = await readObject(env, user, 'bug', a.id);
+      const obj = after.obj ?? src;
+      const problems = [];
+      if (obj.status !== 'active') problems.push(`status 回读为 ${obj.status}（期望 active）`);
+      if (!hasAction(obj, 'activated')) problems.push('动作历史缺少 activated 记录');
+      if (a.assignedTo && accOf(obj.assignedTo) !== a.assignedTo) {
+        problems.push(`assignedTo 回读为 ${accOf(obj.assignedTo) ?? 'null'}（期望 ${a.assignedTo}）`);
+      }
+      if (problems.length) {
+        return { status: 200, ok: false, data: { code: 'ACTION_NOT_APPLIED', reason: '激活 Bug 未生效：' + problems.join('；'), readback: actionSummary('bug', obj) } };
+      }
+      return actionResult(env, 'bug', obj, a.assignedTo && accOf(src.assignedTo) !== a.assignedTo ? 'reassigned' : 'activated');
+    },
+  },
+  // -------------------------------------------------------------------------
+  // Notification Support Layer（MCP 只提供上下文/台账；是否发、发给谁、内容归 ChatGPT；发送归 Gmail）
+  // -------------------------------------------------------------------------
+  {
+    name: 'get_user_contact',
+    title: '用户联系方式',
+    description:
+      '查询用户的姓名与邮箱（供通知用）。优先级：禅道用户 email 非空用禅道的（source=zentao），' +
+      '否则用部署方联系人配置（source=notification_config），绝不猜测邮箱。' +
+      '返回 emailEnabled=false + reason=NO_EMAIL_CONFIGURED 表示无邮箱；用户不存在返回 USER_NOT_FOUND。',
+    inputSchema: {
+      type: 'object',
+      properties: { account: { type: 'string', description: '禅道账号（英文），如 wanganqing' } },
+      required: ['account'],
+    },
+    run: async (env, user, a) => {
+      const contact = await resolveContact(env, user, a.account);
+      if (contact.error === 'USER_NOT_FOUND') {
+        return { status: 404, ok: false, data: { code: 'USER_NOT_FOUND', account: a.account, reason: `禅道用户 ${a.account} 不存在（可先用 list_users 查账号）` } };
+      }
+      return { status: 200, ok: true, data: contact };
+    },
+  },
+  {
+    name: 'get_notification_context',
+    title: '通知上下文',
+    description:
+      '生成某事件的通知上下文（对象标题/项目/负责人/邮箱/URL/notificationKey），供 ChatGPT 判断是否通知、' +
+      '写邮件内容。event 可选：assigned 指派 / reassigned 改派 / finished 完成 / closed 关闭 / canceled 取消 / activated 激活；' +
+      '不传时按对象当前状态推导默认事件。本工具不发邮件。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        objectType: { type: 'string', description: '对象类型：bug / task' },
+        objectID: { type: 'integer', description: '对象 ID' },
+        event: { type: 'string', description: '事件：assigned / reassigned / finished / closed / canceled / activated' },
+      },
+      required: ['objectType', 'objectID'],
+    },
+    run: async (env, user, a) => {
+      const objectType = a.objectType === 'bug' ? 'bug' : a.objectType === 'task' ? 'task' : null;
+      if (!objectType) return { status: 400, ok: false, data: { code: 'INVALID_OBJECT_TYPE', reason: 'objectType 仅支持 bug / task' } };
+      const event = a.event ? String(a.event) : null;
+      if (event && !NOTIFY_EVENTS.includes(event)) {
+        return { status: 400, ok: false, data: { code: 'INVALID_EVENT', reason: `event=${a.event} 不支持`, allowed: NOTIFY_EVENTS } };
+      }
+      const { res, obj } = await readObject(env, user, objectType, a.objectID);
+      if (!obj) return { status: res.status, ok: false, data: { code: 'NOT_FOUND', reason: `${objectType} ${a.objectID} 不存在或无法访问` } };
+      const usedEvent = event ?? defaultEvent(objectType, obj);
+      const acc = accOf(obj.assignedTo);
+      let contact = null;
+      if (acc) {
+        const c = await resolveContact(env, user, acc);
+        contact = c.error ? { account: acc, realname: realnameOf(obj.assignedTo), email: null, emailEnabled: false, reason: 'NO_EMAIL_CONFIGURED' } : c;
+      }
+      let project = null;
+      if (Number(obj.project) > 0) {
+        const pr = await ztFetch(env, user, `/projects/${obj.project}`);
+        if (pr.ok && pr.data && !pr.data.error) {
+          project = { id: Number(obj.project), name: pr.data.name ?? pr.data.project?.name ?? null };
+        }
+      }
+      project ??= { id: Number(obj.project) || 0, name: obj.projectName ?? null };
+      return {
+        status: 200,
+        ok: true,
+        data: {
+          objectType,
+          objectID: obj.id,
+          event: usedEvent,
+          title: objectType === 'bug' ? obj.title : obj.name,
+          status: obj.status,
+          project,
+          assignedTo: acc ? { account: acc, realname: realnameOf(obj.assignedTo) || contact?.realname || '', email: contact?.email ?? null } : null,
+          url: objectUrl(env, objectType, obj.id),
+          notificationKey: acc ? notificationKey(objectType, obj.id, usedEvent, acc) : null,
+          hint: '通知判断、收件人取舍、邮件内容由 ChatGPT 决定；发送用 Gmail 连接器；发送成功后用 record_notification 记账防重复。',
+        },
+      };
+    },
+  },
+  {
+    name: 'get_notification_status',
+    title: '通知发送状态',
+    description:
+      '查询某个通知是否已发送（防重复）。未发送返回 status=not_sent；已发送返回 sent/failed、' +
+      'channel、recipient、sentAt、messageId。台账存于 Cloudflare KV，跨请求持久。',
+    inputSchema: {
+      type: 'object',
+      properties: { notificationKey: { type: 'string', description: '如 bug:130:assigned:wanganqing' } },
+      required: ['notificationKey'],
+    },
+    run: async (env, user, a) => {
+      const parsed = parseNotificationKey(a.notificationKey);
+      if (!parsed) {
+        return { status: 400, ok: false, data: { code: 'INVALID_NOTIFICATION_KEY', reason: 'notificationKey 格式应为 {bug|task}:{id}:{event}:{account}', example: 'bug:130:assigned:wanganqing' } };
+      }
+      const rec = await notifGet(env, a.notificationKey);
+      if (!rec) return { status: 200, ok: true, data: { notificationKey: a.notificationKey, status: 'not_sent' } };
+      return {
+        status: 200,
+        ok: true,
+        data: {
+          notificationKey: a.notificationKey,
+          status: rec.status,
+          channel: rec.channel,
+          recipient: rec.recipient,
+          sentAt: rec.sentAt,
+          messageId: rec.messageId ?? null,
+          error: rec.error ?? null,
+        },
+      };
+    },
+  },
+  {
+    name: 'record_notification',
+    title: '记录通知发送',
+    description:
+      'Gmail 真正发送完成后调用，写入通知台账（防重复）。幂等：同 notificationKey + sent 重复提交不产生重复记录。' +
+      '会校验对象存在、收件人必须与联系人映射匹配，不接受随意伪造收件人。开发/测试可用 messageId=test-message-id-001，不会发真实邮件。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        notificationKey: { type: 'string', description: '如 bug:130:closed:wanganqing' },
+        channel: { type: 'string', description: '固定传 email' },
+        recipient: { type: 'string', description: '实际收件人邮箱，必须与联系人映射一致' },
+        status: { type: 'string', description: 'sent 已发送 / failed 发送失败' },
+        messageId: { type: 'string', description: 'Gmail 返回的消息 ID（可选）' },
+        error: { type: 'string', description: '失败原因（status=failed 时）' },
+      },
+      required: ['notificationKey', 'channel', 'recipient', 'status'],
+    },
+    run: async (env, user, a) => {
+      const parsed = parseNotificationKey(a.notificationKey);
+      if (!parsed) {
+        return { status: 400, ok: false, data: { code: 'INVALID_NOTIFICATION_KEY', reason: 'notificationKey 格式应为 {bug|task}:{id}:{event}:{account}' } };
+      }
+      if (a.channel !== 'email') {
+        return { status: 400, ok: false, data: { code: 'INVALID_CHANNEL', reason: `channel=${a.channel} 仅支持 email` } };
+      }
+      if (a.status !== 'sent' && a.status !== 'failed') {
+        return { status: 400, ok: false, data: { code: 'INVALID_STATUS', reason: `status=${a.status} 仅支持 sent / failed` } };
+      }
+      const existing = await notifGet(env, a.notificationKey);
+      if (existing && existing.status === 'sent' && a.status === 'sent') {
+        return { status: 200, ok: true, data: { code: 'NOTIFICATION_ALREADY_RECORDED', notificationKey: a.notificationKey, record: existing } };
+      }
+      const { obj } = await readObject(env, user, parsed.objectType, parsed.objectID);
+      if (!obj) {
+        return { status: 404, ok: false, data: { code: 'NOT_FOUND', reason: `${parsed.objectType} ${parsed.objectID} 不存在，不允许记账` } };
+      }
+      const contact = await resolveContact(env, user, parsed.account);
+      if (contact.error || !contact.email) {
+        return { status: 400, ok: false, data: { code: 'RECIPIENT_MISMATCH', reason: `联系人 ${parsed.account} 无可配置邮箱，不允许记账到 ${a.recipient}`, contact } };
+      }
+      if (String(a.recipient).trim().toLowerCase() !== String(contact.email).trim().toLowerCase()) {
+        return {
+          status: 400, ok: false,
+          data: { code: 'RECIPIENT_MISMATCH', reason: `收件人 ${a.recipient} 与联系人映射（${contact.email}）不一致，拒绝记账` },
+        };
+      }
+      const record = {
+        notificationKey: a.notificationKey,
+        status: a.status,
+        channel: 'email',
+        recipient: contact.email,
+        sentAt: nowCN(),
+        messageId: a.messageId ?? null,
+        error: a.error ?? null,
+        objectType: parsed.objectType,
+        objectID: parsed.objectID,
+        event: parsed.event,
+        account: parsed.account,
+      };
+      await notifPut(env, a.notificationKey, record);
+      return { status: 200, ok: true, data: { recorded: true, notificationKey: a.notificationKey, record } };
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1084,12 +1836,14 @@ async function handleRpc(env, user, msg) {
     return mcpResult(id, {
       protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : API_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.3.0' },
+      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.4.4' },
       instructions:
         '禅道项目管理连接器。指派任务或需求时 assignedTo 必须用禅道账号（英文），先用 list_users 查询账号；' +
         'productID / executionID 可用 list_products / list_executions 查询。创建需求必填 title；创建任务必填 executionID + name。' +
         '提 Bug 默认挂项目，不允许 project=0；默认映射：' + (projectMapDesc(env) || '未配置（请显式传 projectID）') + '。' +
-        '写操作失败时会返回禅道的中文校验错误，按提示修正参数重试即可。',
+        '写操作失败时会返回禅道的中文校验错误，按提示修正参数重试即可。' +
+        '状态动作用 finish/close/cancel/activate_task 与 resolve/close/activate_bug（Bug 无 cancel，取消/不做/重复类用 resolve_bug 的 willnotfix/duplicate/bydesign 等）。' +
+        '通知流程：动作后 → get_notification_context → get_notification_status 查重 → 由你判断是否通知并用 Gmail 发送 → record_notification 记账；MCP 不发邮件、不写邮件正文。',
     });
   }
   if (method === 'ping') return mcpResult(id, {});
