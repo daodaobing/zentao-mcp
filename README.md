@@ -53,8 +53,8 @@ npx wrangler secret put ZT_PRODUCT_PROJECT_MAP
 
 然后在 ChatGPT 里注册连接器：
 
-1. 打开 chatgpt.com → **设置 → 应用与连接器 → 高级设置 → 开启开发者模式**
-2. **设置 → 连接器 → 创建**：
+1. 打开 chatgpt.com → 左下角头像 → **设置 → 账户安全与登录 → 开启开发者模式**
+2. 返回设置 → **插件 → 创建连接器**：
    - 名称：`禅道`
    - MCP 服务器 URL：`https://<name>.<you>.workers.dev/mcp/<MCP_SECRET>`
    - 身份验证：无身份验证

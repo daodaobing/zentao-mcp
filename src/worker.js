@@ -1193,8 +1193,8 @@ ol{font-size:14px;line-height:1.7;padding-left:20px}
   <button class="copy" onclick="copyUrl()">复制地址</button>
   <p style="font-size:13px;margin:14px 0 4px"><b>在 ChatGPT 里启用（一次性）：</b></p>
   <ol>
-    <li>打开 chatgpt.com → 设置 → 应用与连接器 → 高级设置 → 开启「开发者模式」</li>
-    <li>设置 → 连接器 → 创建：名称填「禅道」，MCP 服务器 URL 填上面这条地址，身份验证选「无身份验证」</li>
+    <li>打开 chatgpt.com → 左下角头像 → 设置 → 账户安全与登录 → 开启「开发者模式」</li>
+    <li>返回设置 → 插件 → 创建连接器：名称填「禅道」，MCP 服务器 URL 填上面这条地址，身份验证选「无身份验证」</li>
     <li>创建后，在聊天输入框的工具里启用「禅道」，即可直接对话使用</li>
   </ol>
   <p style="font-size:12px;color:#57606a">请勿把这条地址分享给他人——它等同于你的禅道身份。如泄露，回到本页用同一账号重新注册即可作废旧地址。</p>
