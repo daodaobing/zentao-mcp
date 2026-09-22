@@ -5,5 +5,11 @@
   "workers_dev": true,
   "observability": {
     "enabled": true
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "ZT_USERS",
+      "id": "1be0f4cdcb3e482cb1703d8fc662330f"
+    }
+  ]
 }

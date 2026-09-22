@@ -66,11 +66,31 @@ npx wrangler secret put ZT_PRODUCT_PROJECT_MAP
 
 ## 多用户：同事用自己的禅道账号
 
-两种模式，按信任模型选择。
+三种模式，按信任模型选择。
 
-### 模式 A · 共享部署（同事零配置，推荐小团队）
+### 模式 A · 网页自助注册（同事零依赖，管理员零后续，推荐）
 
-你维护一个 Worker，每个同事一条专属 URL。同事创建的 Bug `openedBy` 是**他们自己的账号**，审计归属清晰。
+同事打开 Worker 首页，凭邀请码 + 自己的禅道账号密码自助拿到专属连接器地址——**不需要管理员在场，也不需要装任何东西**。
+
+一次性启用（管理员）：
+
+```bash
+npx wrangler kv namespace create ZT_USERS
+# 把返回的 id 填进 wrangler.jsonc 的 kv_namespaces
+
+npx wrangler secret put INVITE_CODE   # 邀请码，发给同事（改它即可让旧码失效）
+npx wrangler secret put REG_KEY       # 32 字节随机 hex：openssl rand -hex 32
+npx wrangler deploy
+```
+
+之后把 `https://<name>.<you>.workers.dev/` 和邀请码发给同事即可。注册页会：
+
+- 用提交的凭据**实时登录禅道校验**（错误密码直接拒绝，不落盘）
+- 生成他的专属 MCP URL，页面直接展示 ChatGPT 绑定步骤
+- 凭据以 **AES-GCM 加密**存入 KV（密钥是 REG_KEY，独立于禅道账号）
+- 同一账号重复注册自动**轮换**地址（旧的立即失效）——地址泄露时同事可自助作废
+
+### 模式 B · 管理员代开（环境变量）
 
 ```bash
 # 为同事 wanganqing 开通（大写账号作环境变量后缀）
@@ -80,11 +100,13 @@ npx wrangler secret put ZT_USER_WANGANQING     # 同事的禅道密码
 
 同事拿到的 URL：`https://<name>.<you>.workers.dev/mcp/<ZT_SECRET_WANGANQING>`，按上面同样的步骤在**他自己的** ChatGPT 里注册连接器即可。
 
-> 信任说明：此模式下同事的禅道密码存放在**你的** Cloudflare 账号里（secret 只写不可读）。不合适就换模式 B。
-
-### 模式 B · 各自部署（完全隔离）
+### 模式 C · 各自部署（完全隔离）
 
 每人 fork 本仓库 → 自己的 Cloudflare 账号 → 按快速开始部署。凭据不出自己的掌控，互不信任也无所谓。
+
+三种模式下同事创建的 Bug `openedBy` 都是**他们自己的账号**，审计归属清晰。
+
+> 信任说明：模式 A/B 下同事的禅道密码存放在**你的** Cloudflare 账号里（A 为加密 KV，B 为 secret——secret 只写不可读）。不合适就换模式 C。
 
 ## 截图内嵌是怎么做的
 

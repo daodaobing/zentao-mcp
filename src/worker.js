@@ -31,7 +31,9 @@ const API_VERSION = '2025-06-18';
 const tokenCache = new Map(); // account -> API token
 const webSessions = new Map(); // account -> web session cookie
 
-function resolveUser(env, secret) {
+// Static env secrets first (ZT_SECRET_<ACCOUNT> / MCP_SECRET), then the
+// ZT_USERS KV store filled by the self-service registration page.
+async function resolveUser(env, secret) {
   if (!secret) return null;
   if (env.MCP_SECRET && secret === env.MCP_SECRET) {
     if (!env.ZT_ACCOUNT || !env.ZT_PASSWORD) return null;
@@ -44,6 +46,19 @@ function resolveUser(env, secret) {
       ?? (account === env.ZT_ACCOUNT ? env.ZT_PASSWORD : undefined);
     if (!password) return null;
     return { account, password };
+  }
+  // self-service registered users (AES-GCM encrypted credentials in KV)
+  if (env.ZT_USERS) {
+    try {
+      const blob = await env.ZT_USERS.get('s:' + secret);
+      if (blob) {
+        const key = await getRegKey(env);
+        if (key) {
+          const cred = await decryptCred(key, blob);
+          if (cred && cred.account && cred.password) return cred;
+        }
+      }
+    } catch { /* fall through to reject */ }
   }
   return null;
 }
@@ -1104,11 +1119,166 @@ async function handleRpc(env, user, msg) {
   return mcpError(id, -32601, `Method not found: ${method}`);
 }
 
+// ---------------------------------------------------------------------------
+// Self-service registration (optional). GET / serves a small page where
+// teammates enter an invite code + their own ZenTao credentials; POST /register
+// verifies the credentials against ZenTao, mints a per-user secret URL and
+// stores the (AES-GCM encrypted) credentials in the ZT_USERS KV namespace.
+// Requires: INVITE_CODE and REG_KEY (64 hex chars) secrets + ZT_USERS binding.
+// ---------------------------------------------------------------------------
+
+const regRate = new Map(); // ip -> { count, windowStart }
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+async function getRegKey(env) {
+  if (!env.REG_KEY || !/^[0-9a-fA-F]{64}$/.test(env.REG_KEY)) return null;
+  return crypto.subtle.importKey('raw', hexToBytes(env.REG_KEY), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function encryptCred(key, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = new TextEncoder().encode(JSON.stringify(obj));
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data));
+  const blob = new Uint8Array(iv.length + cipher.length);
+  blob.set(iv, 0); blob.set(cipher, iv.length);
+  let bin = '';
+  for (const b of blob) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+async function decryptCred(key, blob) {
+  const bin = atob(blob);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, key, bytes.slice(12));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+function regPage() {
+  return new Response(`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>禅道连接器注册</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f6f9;margin:0;padding:40px 16px;color:#24292f}
+.card{max-width:520px;margin:0 auto;background:#fff;border:1px solid #d0d7de;border-radius:12px;padding:28px}
+h1{font-size:20px;margin:0 0 6px}p.sub{color:#57606a;font-size:14px;margin:0 0 20px}
+label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}
+input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #d0d7de;border-radius:8px;font-size:14px}
+button{margin-top:20px;width:100%;padding:11px;background:#1f6feb;color:#fff;border:0;border-radius:8px;font-size:15px;cursor:pointer}
+button:disabled{opacity:.6;cursor:default}
+.msg{margin-top:14px;padding:10px 12px;border-radius:8px;font-size:14px;display:none}
+.err{background:#fff1f0;border:1px solid #ffccc7;color:#cf1322}
+.ok{background:#f6ffed;border:1px solid #b7eb8f;color:#389e0d}
+.url{word-break:break-all;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:10px;font-family:ui-monospace,monospace;font-size:13px;margin:8px 0}
+ol{font-size:14px;line-height:1.7;padding-left:20px}
+.copy{float:right;font-size:12px;padding:3px 10px;width:auto;margin:0}
+</style></head><body>
+<div class="card">
+<h1>禅道 MCP 连接器 · 自助注册</h1>
+<p class="sub">注册后你会得到一条专属连接器地址，在 ChatGPT 里绑定即可用自己的禅道账号提 Bug / 查任务。密码仅用于连接禅道（加密存储），不会发给任何第三方。</p>
+<label>邀请码</label><input id="invite" placeholder="向管理员获取">
+<label>禅道账号（英文）</label><input id="account" autocomplete="off" placeholder="例如 zhangsan">
+<label>禅道密码</label><input id="password" type="password">
+<button id="go" onclick="reg()">生成我的连接器地址</button>
+<div id="err" class="msg err"></div>
+<div id="ok" class="msg ok" style="display:none">
+  <b>注册成功！你的专属连接器地址：</b>
+  <div class="url" id="url"></div>
+  <button class="copy" onclick="copyUrl()">复制地址</button>
+  <p style="font-size:13px;margin:14px 0 4px"><b>在 ChatGPT 里启用（一次性）：</b></p>
+  <ol>
+    <li>打开 chatgpt.com → 设置 → 应用与连接器 → 高级设置 → 开启「开发者模式」</li>
+    <li>设置 → 连接器 → 创建：名称填「禅道」，MCP 服务器 URL 填上面这条地址，身份验证选「无身份验证」</li>
+    <li>创建后，在聊天输入框的工具里启用「禅道」，即可直接对话使用</li>
+  </ol>
+  <p style="font-size:12px;color:#57606a">请勿把这条地址分享给他人——它等同于你的禅道身份。如泄露，回到本页用同一账号重新注册即可作废旧地址。</p>
+</div>
+</div>
+<script>
+async function reg(){
+  var err=document.getElementById('err'),ok=document.getElementById('ok'),btn=document.getElementById('go');
+  err.style.display='none';ok.style.display='none';
+  btn.disabled=true;btn.textContent='验证中…';
+  try{
+    var r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({invite:invite.value.trim(),account:account.value.trim(),password:password.value})});
+    var d=await r.json();
+    if(r.status!==200&&r.status!==201){throw new Error(d.error||('HTTP '+r.status))}
+    document.getElementById('url').textContent=d.mcpUrl;
+    ok.style.display='block';ok.scrollIntoView({behavior:'smooth'});
+  }catch(e){err.textContent='注册失败：'+e.message;err.style.display='block'}
+  finally{btn.disabled=false;btn.textContent='生成我的连接器地址'}
+}
+function copyUrl(){navigator.clipboard.writeText(document.getElementById('url').textContent)}
+</script>
+</body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleRegister(request, env) {
+  if (!env.INVITE_CODE || !env.ZT_USERS || !env.REG_KEY) {
+    return jsonResponse({ error: '自助注册未启用（管理员需配置 INVITE_CODE / REG_KEY secrets 和 ZT_USERS KV）' }, 503);
+  }
+  let body;
+  try { body = await request.json(); } catch { return jsonResponse({ error: '请求格式错误' }, 400); }
+  const { invite, account, password } = body || {};
+  if (!invite || invite !== env.INVITE_CODE) return jsonResponse({ error: '邀请码不正确' }, 403);
+  if (!account || !/^[a-zA-Z0-9_.-]{2,40}$/.test(account)) return jsonResponse({ error: '禅道账号格式不正确（英文账号）' }, 400);
+  if (!password || String(password).length < 1) return jsonResponse({ error: '请填写禅道密码' }, 400);
+  // simple per-IP rate limit
+  const ip = request.headers.get('cf-connecting-ip') || '?';
+  const now = Date.now();
+  const rl = regRate.get(ip);
+  if (!rl || now - rl.windowStart > 3600e3) regRate.set(ip, { count: 1, windowStart: now });
+  else if (++rl.count > 10) return jsonResponse({ error: '尝试过于频繁，请一小时后再试' }, 429);
+  // verify credentials against ZenTao before storing anything
+  let verified = false;
+  try {
+    const res = await fetch(apiBase(env) + '/tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account, password: String(password) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    verified = res.ok && !!data.token;
+  } catch { verified = false; }
+  if (!verified) return jsonResponse({ error: '禅道账号或密码不正确（已实时校验）' }, 401);
+  // mint secret; re-registering replaces (and invalidates) the old URL
+  const key = await getRegKey(env);
+  const enc = await encryptCred(key, { account, password: String(password) });
+  const old = await env.ZT_USERS.get('u:' + account.toLowerCase());
+  const secretB = new Uint8Array(32);
+  crypto.getRandomValues(secretB);
+  const secret = Array.from(secretB, b => b.toString(16).padStart(2, '0')).join('');
+  if (old) await env.ZT_USERS.delete('s:' + old);
+  await env.ZT_USERS.put('s:' + secret, enc);
+  await env.ZT_USERS.put('u:' + account.toLowerCase(), secret);
+  const origin = new URL(request.url).origin;
+  return jsonResponse({ mcpUrl: `${origin}/mcp/${secret}` }, 201);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // routes: / and /register = self-service signup; /mcp/<secret> = MCP
+    const pathOnly = url.pathname.replace(/\/+$/, '');
+    if (pathOnly === '' || pathOnly === '/index.html') {
+      return regPage();
+    }
+    if (pathOnly === '/register') {
+      if (request.method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
+      return handleRegister(request, env);
+    }
+    if (!url.pathname.startsWith('/mcp/')) {
+      return jsonResponse({ error: 'Not found' }, 404);
+    }
     const secret = decodeURIComponent(url.pathname.replace(/^\/mcp\//, '').replace(/\/+$/, ''));
-    const user = resolveUser(env, secret);
+    const user = await resolveUser(env, secret);
     if (!user) {
       return jsonResponse({ error: 'Unauthorized' }, 401);
     }
