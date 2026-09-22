@@ -1,0 +1,8 @@
+.dev.vars
+.tmp/
+tmp/
+.wrangler/
+node_modules/
+*.log
+DEPLOY.md
+tests-local/

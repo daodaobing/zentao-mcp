@@ -1,0 +1,23 @@
+# Copy to .dev.vars for local dev (wrangler dev), or set as production secrets:
+#   npx wrangler secret put <NAME>
+# Never commit .dev.vars.
+
+# ZenTao base URL, e.g. https://zentao.example.com (no trailing slash; a /zentao
+# subdirectory path is fine). Only the v1 REST API is used.
+ZT_BASE=https://zentao.example.com
+
+# Single-user mode: the credentials behind /mcp/<MCP_SECRET>
+ZT_ACCOUNT=myaccount
+ZT_PASSWORD=mypassword
+MCP_SECRET=change-me-random-hex
+
+# Optional: product -> default project map for bug creation (JSON).
+# Keeps "bugs must hang off a project" without hardcoding IDs in code.
+ZT_PRODUCT_PROJECT_MAP={"7":93}
+
+# Optional multi-user mode: one secret URL per ZenTao account.
+#   /mcp/<ZT_SECRET_WANGANQING> logs in as wanganqing
+# Password comes from ZT_USER_<ACCOUNT> (falls back to ZT_PASSWORD when the
+# account equals ZT_ACCOUNT).
+# ZT_SECRET_WANGANQING=another-random-hex
+# ZT_USER_WANGANQING=wanganqings-password
