@@ -275,7 +275,7 @@ async function uploadImageWeb(env, user, bytes, filename, mime) {
   let data;
   try { data = JSON.parse(res.text); } catch { data = { error: 1, message: '上传响应异常: ' + res.text.slice(0, 120) }; }
   if (data.error !== 0 || !data.url) {
-    throw new Error('图片上传失败: ' + JSON.stringify(data).slice(0, 200));
+    throw Object.assign(new Error('图片上传失败: ' + JSON.stringify(data).slice(0, 200)), { code: 'UPLOAD_FAILED' });
   }
   return data.url; // site-relative, e.g. /zentao/file-read-302.png — use verbatim
 }
@@ -287,7 +287,7 @@ function escapeHtml(s) {
 // Build the steps HTML: description (plain text or HTML) with optional
 // [截图:N] / [图:N] markers replaced by the uploaded images; unreferenced
 // images are appended in a 问题截图 section.
-function buildStepsHtml(description, uploaded) {
+function buildStepsHtml(description, uploaded, sectionTitle) {
   let html = String(description ?? '').trim();
   if (/<p[ >]|<img|<br/i.test(html)) {
     html = html; // already HTML-ish, keep as-is
@@ -296,66 +296,269 @@ function buildStepsHtml(description, uploaded) {
   }
   const used = new Set();
   html = html.replace(/\[\s*截图\s*[:：]?\s*(\d+)\s*\]|\[\s*图\s*[:：]?\s*(\d+)\s*\]/g, (m0, n1, n2) => {
-    const n = Number(n1 || n2);
-    const img = uploaded[n - 1];
-    if (!img) return ''; // upload failed: drop the marker instead of leaving literal text
-    used.add(n - 1);
+    const n = Number(n1 || n2) - 1; // 标记编号 = 用户传入 images[] 的原始位置（1 起）
+    // 必须按 inputIndex 匹配：uploaded[] 只含成功项，若用 n-1 直接索引，前图失败时会
+    // 错位（把第 2 张图插进 [截图:1]）；标记指向失败图时删除标记，不换别的图、不留字面文本。
+    const img = uploaded.find(u => u.inputIndex === n);
+    if (!img) return '';
+    used.add(n);
     return `<img src="${img.url}" alt="${escapeHtml(img.alt)}" />`;
   });
-  const rest = uploaded.filter((_, i) => !used.has(i));
+  const rest = uploaded.filter(u => !used.has(u.inputIndex));
   if (rest.length) {
-    html += '<p><strong>问题截图：</strong></p>' + rest.map(img => `<img src="${img.url}" alt="${escapeHtml(img.alt)}" />`).join('');
+    html += '<p><strong>' + escapeHtml(sectionTitle || '问题截图') + '：</strong></p>' + rest.map(img => `<img src="${img.url}" alt="${escapeHtml(img.alt)}" />`).join('');
   }
   return html;
 }
 
-// Load image bytes for an images[] entry: base64 inline or fetch a URL.
-async function loadImageBytes(item, index) {
-  const spec = item ?? {};
-  const name = spec.filename || spec.name || `截图${index + 1}`;
-  if (spec.base64) {
-    const b64 = String(spec.base64).replace(/^data:[^;]+;base64,/, '').replace(/\s+/g, '');
-    const bin = atob(b64);
-    if (bin.length > MAX_IMAGE_BYTES) throw new Error(`图片 ${name} 过大（${bin.length} 字节，上限 ${MAX_IMAGE_BYTES}）`);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const anyExt = (/\.([a-z0-9]+)$/i.exec(name) || [])[1]?.toLowerCase();
-    if (anyExt && !IMAGE_EXTS.includes(anyExt)) throw new Error(`不支持的图片格式 .${anyExt}（仅支持 ${IMAGE_EXTS.join('/')}）`);
-    const ext = IMAGE_EXTS.includes(anyExt) ? anyExt : 'png';
-    return { bytes, filename: anyExt ? name : name + '.' + ext, mime: 'image/' + (ext === 'jpg' ? 'jpeg' : ext), alt: spec.alt || name };
+// ===========================================================================
+// 统一图片模块（create_bug / update_bug / create_task / update_task 共用）
+// 规范化 -> 校验 -> 解码 -> 上传禅道 -> 内嵌 HTML，任何单张失败不影响其它图。
+// ===========================================================================
+// data URL 前缀：容忍任意 mime 参数（charset 等）与大小写 BASE64。
+// 旧实现 /^data:[^;]+;base64,/ 遇 data:image/png;charset=utf-8;base64, 剥不掉前缀，
+// atob 直接炸 "invalid base64" —— 这是大图上传失败的根因之一。
+const DATA_URL_RE = /^data:[^,]*;base64,/i;
+
+// Base64 规范化：剥 data URL 前缀、去换行/CR/空格、URL-safe 变体（- _）还原为 + /、
+// 剥包裹引号；不触碰合法的 + / =。解码用手写字典表（Cloudflare Worker 无 Node Buffer；
+// atob 对任意长度/变体不稳且报错无诊断——之前 100KB 图就是在这里炸的）。
+function normalizeBase64(input) {
+  let s = String(input == null ? '' : input);
+  s = s.replace(DATA_URL_RE, '');
+  s = s.replace(/[\r\n\s\u00a0]+/g, '');
+  s = s.replace(/^["']+/, '').replace(/["']+$/, '');
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  const stripped = s.replace(/=+$/, '');
+  if (!stripped) return { error: 'BASE64_EMPTY', message: 'base64 内容为空' };
+  if (!/^[A-Za-z0-9+/]*$/.test(stripped)) {
+    const bad = stripped.match(/[^A-Za-z0-9+/]/);
+    return { error: 'BASE64_INVALID_CHARS', message: 'base64 含非法字符 ' + JSON.stringify(bad && bad[0]) + '（位置 ' + (bad ? stripped.indexOf(bad[0]) : '?') + '；仅允许 A-Z a-z 0-9 + / = 与换行空白，+ / = 不会被错误剥离）' };
   }
-  if (spec.url) {
-    const res = await fetch(spec.url, { headers: { 'User-Agent': UA } });
-    if (!res.ok) throw new Error(`图片 ${name} 下载失败（HTTP ${res.status}，URL 需公网可匿名访问）`);
-    const buf = new Uint8Array(await res.arrayBuffer());
-    if (buf.length > MAX_IMAGE_BYTES) throw new Error(`图片 ${name} 过大（${buf.length} 字节）`);
-    let ext = (/\.(png|jpe?g|gif|bmp|webp)(?:$|[?#])/i.exec(spec.url) || [])[1]?.toLowerCase();
-    const ctype = (res.headers.get('content-type') || '').toLowerCase();
-    if (!ext && ctype.startsWith('image/')) ext = ctype.split('/')[1].split(';')[0];
-    const anyExt2 = (/\.([a-z0-9]+)(?:$|[?#])/i.exec(spec.url) || [])[1]?.toLowerCase();
-    if (!ext && anyExt2) throw new Error(`不支持的图片格式 .${anyExt2}（仅支持 ${IMAGE_EXTS.join('/')}）`);
-    return { bytes: buf, filename: name + '.' + (ext || 'png'), mime: 'image/' + (ext === 'jpg' ? 'jpeg' : ext || 'png'), alt: spec.alt || name };
+  if (stripped.length % 4 === 1) {
+    return {
+      error: 'BASE64_TRUNCATED',
+      message: 'base64 长度 ' + stripped.length + ' 非法（mod 4 = 1，典型为传输截断/丢尾部）；请检查调用链路是否截断长字符串，或改用 url 方式传图',
+    };
   }
-  throw new Error(`图片 ${index + 1} 缺少 url 或 base64`);
+  return { base64: stripped + '='.repeat((4 - (stripped.length % 4)) % 4) };
 }
 
-async function uploadBugImages(env, user, images) {
+const B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const B64_LOOKUP = (() => {
+  const t = new Int16Array(128).fill(-1);
+  for (let i = 0; i < 64; i++) t[B64_ALPHABET.charCodeAt(i)] = i;
+  return t;
+})();
+
+// 严格 base64 -> Uint8Array。字典表解码；非法字符/padding 报诊断错误码。
+function decodeBase64Bytes(b64) {
+  const core = b64.replace(/=+$/, '');
+  const rem = core.length % 4;
+  const outLen = (core.length >> 2) * 3 + (rem === 2 ? 1 : rem === 3 ? 2 : 0);
+  const out = new Uint8Array(outLen);
+  let o = 0;
+  for (let i = 0; i < core.length; i += 4) {
+    const c0 = B64_LOOKUP[core.charCodeAt(i)];
+    const c1 = i + 1 < core.length ? B64_LOOKUP[core.charCodeAt(i + 1)] : -1;
+    const c2 = i + 2 < core.length ? B64_LOOKUP[core.charCodeAt(i + 2)] : -1;
+    const c3 = i + 3 < core.length ? B64_LOOKUP[core.charCodeAt(i + 3)] : -1;
+    if (c0 < 0 || c1 < 0) throw Object.assign(new Error('base64 解码失败：内容在解码中途损坏'), { code: 'BASE64_MALFORMED' });
+    if (c2 >= 0) out[o++] = (c0 << 2) | (c1 >> 4);
+    else { out[o++] = (c0 << 2) | (c1 >> 4); break; }
+    if (c3 >= 0) { out[o++] = ((c1 & 15) << 4) | (c2 >> 2); out[o++] = ((c2 & 3) << 6) | c3; }
+    else if (c2 >= 0) { out[o++] = ((c1 & 15) << 4) | (c2 >> 2); break; }
+  }
+  return out;
+}
+
+// 魔数嗅探：png/jpg/gif/webp/bmp，识别不出返回 null（宽容，不拦截未知二进制）。
+function sniffImageExt(bytes) {
+  const b = bytes;
+  if (b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'png';
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'jpg';
+  if (b.length > 6 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'gif';
+  if (b.length > 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+      && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'webp';
+  if (b.length > 2 && b[0] === 0x42 && b[1] === 0x4d) return 'bmp';
+  return null;
+}
+
+// images[] 规范化校验（不碰网络）：url / base64 二选一；file/filePath/fileUrl 仅识别
+// ——MCP streamable-HTTP 协议无通用文件句柄，拿不到连接器文件字节，统一报
+// FILE_REF_UNSUPPORTED 并提示改用 url（优先）或 base64（兜底）。
+function normalizeImageInput(item, index) {
+  const spec = (item && typeof item === 'object') ? item : null;
+  if (!spec) return { error: 'INVALID_IMAGE_ITEM', message: 'images[' + index + '] 不是对象' };
+  const name = String(spec.filename || spec.name || ('截图' + (index + 1)));
+  const hasUrl = typeof spec.url === 'string' && spec.url.trim() !== '';
+  const hasB64 = typeof spec.base64 === 'string' && spec.base64.trim() !== '';
+  const fileRef = spec.file !== undefined ? spec.file : (spec.filePath !== undefined ? spec.filePath : spec.fileUrl);
+  // url 与 base64 同传时按优先级取 url（公网地址优先，base64 只是兜底），不算错误
+  if (!hasUrl && !hasB64 && fileRef === undefined) {
+    return { error: 'MISSING_SOURCE', message: '图片 ' + name + ' 缺少 url / base64（url 优先，base64 兜底）' };
+  }
+  if (!hasUrl && !hasB64 && fileRef !== undefined) {
+    return { error: 'FILE_REF_UNSUPPORTED', message: '图片 ' + name + ' 用了 file/filePath/fileUrl：MCP 协议无通用文件句柄，连接器拿不到文件字节。请改用 url（公网可访问，优先）或 base64（兜底）' };
+  }
+  const anyExt = (/\.([a-z0-9]+)$/i.exec(name) || [])[1];
+  const extHint = anyExt ? anyExt.toLowerCase() : null;
+  if (extHint && !IMAGE_EXTS.includes(extHint)) {
+    return { error: 'UNSUPPORTED_EXT', message: '不支持的图片格式 .' + extHint + '（仅支持 ' + IMAGE_EXTS.join('/') + '）' };
+  }
+  return { name: name, url: hasUrl ? spec.url.trim() : null, base64: hasB64 ? spec.base64 : null, alt: spec.alt || name, extHint: extHint };
+}
+
+// 读取图片字节（base64 解码 或 URL 下载），统一 size / ext / 魔数校验。
+async function loadImageBytes(item, index) {
+  const norm = normalizeImageInput(item, index);
+  if (norm.error) throw Object.assign(new Error(norm.message), { code: norm.error });
+  let bytes, fromUrl = null, ctype = '';
+
+  // 来源优先级：url（公网地址）优先，base64 兜底——两者同传时走 url
+  if (norm.url) {
+    let res;
+    try {
+      res = await fetch(norm.url, { headers: { 'User-Agent': UA } });
+    } catch (e) {
+      throw Object.assign(new Error('图片 ' + norm.name + ' 下载失败：' + ((e && e.message) || e) + '（URL 需公网可匿名访问）'), { code: 'DOWNLOAD_FAILED' });
+    }
+    if (!res.ok) throw Object.assign(new Error('图片 ' + norm.name + ' 下载失败（HTTP ' + res.status + '，URL 需公网可匿名访问）'), { code: 'DOWNLOAD_FAILED' });
+    bytes = new Uint8Array(await res.arrayBuffer());
+    fromUrl = norm.url;
+    ctype = (res.headers.get('content-type') || '').toLowerCase();
+  } else {
+    const n = normalizeBase64(norm.base64);
+    if (n.error) throw Object.assign(new Error(n.message), { code: n.error });
+    // 解码前先按 base64 长度预判体积：超限直接拒绝，避免为注定失败的大图白烧解码 CPU
+    const approx = Math.floor(n.base64.length / 4) * 3;
+    if (approx > MAX_IMAGE_BYTES) {
+      throw Object.assign(new Error('图片 ' + norm.name + ' 过大（约 ' + approx + ' 字节，上限 ' + MAX_IMAGE_BYTES + '）'), { code: 'IMAGE_TOO_LARGE' });
+    }
+    bytes = decodeBase64Bytes(n.base64);
+  }
+
+  if (bytes.length > MAX_IMAGE_BYTES) {
+    throw Object.assign(new Error('图片 ' + norm.name + ' 过大（' + bytes.length + ' 字节，上限 ' + MAX_IMAGE_BYTES + '）'), { code: 'IMAGE_TOO_LARGE' });
+  }
+  if (bytes.length === 0) {
+    throw Object.assign(new Error('图片 ' + norm.name + ' 解码结果为空'), { code: 'IMAGE_EMPTY' });
+  }
+
+  // 扩展名：显式 filename 优先；URL path / content-type 推断次之；魔数兜底纠偏
+  let ext = norm.extHint;
+  if (!ext && fromUrl) {
+    ext = (/\.(png|jpe?g|gif|bmp|webp)(?:$|[?#])/i.exec(fromUrl) || [])[1];
+    ext = ext ? ext.toLowerCase() : null;
+    if (!ext && ctype.indexOf('image/') === 0) {
+      const c = ctype.split('/')[1].split(';')[0];
+      if (IMAGE_EXTS.includes(c)) ext = c === 'jpeg' ? 'jpg' : c;
+    }
+  }
+  const sniffed = sniffImageExt(bytes);
+  if (sniffed) {
+    if (!norm.extHint && ext && ext !== sniffed && !(ext === 'jpg' && sniffed === 'jpg') && !(ext === 'jpeg' && sniffed === 'jpg')) {
+      ext = sniffed; // URL/content-type 与实际字节不符时以字节为准
+    }
+    if (!ext) ext = sniffed;
+    if (norm.extHint && sniffed
+        && !(norm.extHint === sniffed)
+        && !(norm.extHint === 'jpg' && sniffed === 'jpg')
+        && !(norm.extHint === 'jpeg' && sniffed === 'jpg')) {
+      throw Object.assign(new Error('图片 ' + norm.name + ' 声明扩展名 .' + norm.extHint + ' 但实际字节是 .' + sniffed + '（请修正 filename 扩展名）'), { code: 'EXT_MISMATCH' });
+    }
+  }
+  if (!ext) ext = 'png';
+  const canonicalExt = ext === 'jpeg' ? 'jpg' : ext;
+  return {
+    bytes: bytes,
+    filename: norm.extHint ? norm.name : norm.name + '.' + canonicalExt,
+    mime: 'image/' + (canonicalExt === 'jpg' ? 'jpeg' : canonicalExt),
+    alt: norm.alt,
+  };
+}
+
+// 上传 + 内嵌一体化（Bug/Task 共用）。上传走 web 通道（file-ajaxUpload，imgFile 字段，
+// 已验证 file-read-N 相对 URL），内嵌走 buildStepsHtml 的 [截图:N] 标记 / 截图区。
+async function uploadObjectImages(env, user, images) {
   const uploaded = [];
   const failures = [];
   let idx = 0;
   for (const item of (images || [])) {
     try {
-      const { bytes, filename, mime, alt } = await loadImageBytes(item, idx);
-      const ext = (/\.([a-z0-9]+)$/i.exec(filename) || [])[1]?.toLowerCase() || 'png';
-      if (!IMAGE_EXTS.includes(ext)) throw new Error(`不支持的图片格式 .${ext}（仅支持 ${IMAGE_EXTS.join('/')}）`);
-      const url = await uploadImageWeb(env, user, bytes, filename, mime);
-      uploaded.push({ url, filename, alt: alt || filename });
+      const loaded = await loadImageBytes(item, idx);
+      let url;
+      try {
+        url = await uploadImageWeb(env, user, loaded.bytes, loaded.filename, loaded.mime);
+      } catch (upErr) {
+        if (!upErr.code) upErr.code = 'UPLOAD_FAILED'; // 登录/网络类异常也归入上传失败，不漏成 UNKNOWN
+        throw upErr;
+      }
+      uploaded.push({ url: url, filename: loaded.filename, alt: loaded.alt || loaded.filename, inputIndex: idx });
     } catch (err) {
-      failures.push({ index: idx, filename: item?.filename || item?.name || `截图${idx + 1}`, reason: err?.message ?? String(err) });
+      failures.push({
+        index: idx,
+        filename: (item && (item.filename || item.name)) || ('截图' + (idx + 1)),
+        reason: (err && err.code) || 'UNKNOWN',
+        message: (err && err.message) || String(err),
+      });
     }
     idx++;
   }
-  return { uploaded, failures };
+  return { uploaded: uploaded, failures: failures };
+}
+
+// 兼容旧名
+const uploadBugImages = uploadObjectImages;
+
+// 统一图片结果块：images: {requested, uploaded, embedded, failed}。
+// embedCheck=回读的富文本原文，逐图核对 <img src> 是否真实内嵌；failed.reason 统一为错误码
+// （BASE64_INVALID_CHARS / IMAGE_TOO_LARGE / EXT_MISMATCH / FILE_REF_UNSUPPORTED …）。
+// 单图失败不影响其它图与对象本身；uploaded=0 或部分失败时给出 warnings（规格六）。
+function imageResult(userAttempted, uploaded, failures, embedCheck) {
+  const embedded = uploaded.filter(u => !embedCheck || embedCheck.includes(u.url)).length;
+  const images = {
+    requested: userAttempted,
+    uploaded: uploaded.length,
+    embedded,
+    failed: failures.map(f => ({ index: f.index, filename: f.filename, reason: f.reason, message: f.message })),
+  };
+  const warnings = [];
+  if (userAttempted > 0 && uploaded.length === 0) {
+    warnings.push('用户传了 ' + userAttempted + ' 张图片但全部未上传成功（uploaded=0），正文中没有图片，详见 images.failed');
+  } else if (failures.length) {
+    warnings.push('部分图片未成功（失败 ' + failures.length + '/' + userAttempted + '），详见 images.failed');
+  }
+  if (uploaded.length && embedded < uploaded.length) {
+    warnings.push('有 ' + (uploaded.length - embedded) + ' 张图已上传禅道文件系统但未在正文中检索到，可能被服务端剥离，请在网页端核实');
+  }
+  return { images, warnings };
+}
+
+// images[] 数组项 schema（四个工具共用）：来源优先级 1.file/filePath/fileUrl 文件引用
+// （MCP streamable-HTTP 无通用文件句柄，识别后报 FILE_REF_UNSUPPORTED）2.url 公网地址 3.base64 兜底。
+const IMAGE_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    url: { type: 'string', description: '图片 URL，需公网可匿名访问（与 base64 二选一；两者都有优先 url）' },
+    base64: { type: 'string', description: '图片 base64（与 url 二选一）。可带 data:image/png;base64, 前缀（mime 带 charset 等参数亦可），可含换行/空格，支持 URL-safe 变体' },
+    filename: { type: 'string', description: '文件名（决定扩展名，支持中文），默认 截图N.png' },
+    alt: { type: 'string', description: '图片 alt 描述' },
+    file: { type: 'string', description: '本地文件引用：MCP 协议无文件句柄暂不支持（返回 FILE_REF_UNSUPPORTED），请改用 url 或 base64' },
+    filePath: { type: 'string', description: '同 file' },
+    fileUrl: { type: 'string', description: '同 file' },
+  },
+};
+
+function imagesSchema(target) {
+  return {
+    type: 'array',
+    description: '截图列表，真实上传到禅道文件系统并内嵌到' + target + '富文本（不是普通附件，详情页直接可见）。' +
+      '来源优先级：1.file/filePath/fileUrl 文件引用（当前 MCP 协议无文件句柄，暂不支持，会返回 FILE_REF_UNSUPPORTED）2.url 公网图片地址 3.base64（兜底，稳定解码）。' +
+      '支持 png/jpg/jpeg/gif/bmp/webp，单图 ≤9MB。' + target + '中用 [截图:1]、[截图:2] 标记指定插入位置；未标记的图统一追加到「问题截图」（关联需求的任务为「参考截图」）区。' +
+      '单图失败不影响其它图，返回 images.failed 明细（filename + reason）。',
+    items: IMAGE_ITEM_SCHEMA,
+  };
 }
 
 // Web-form bug create/edit. Returns { ok, data } like ztFetch.
@@ -780,19 +983,7 @@ const TOOLS = [
         severity: { type: 'integer', description: '严重程度 1-4，默认 3' },
         priority: { type: 'integer', description: '优先级 1-4，默认 3' },
         type: { type: 'string', description: 'Bug 类型，默认 codeerror' },
-        images: {
-          type: 'array',
-          description: '截图列表，直接内嵌到重现步骤富文本（不是附件）。description 中可用 [截图:1]、[截图:2] 标记插入位置，未标记的图统一排到「问题截图」区。支持 png/jpg/jpeg/gif/bmp/webp，单图 ≤9MB',
-          items: {
-            type: 'object',
-            properties: {
-              url: { type: 'string', description: '图片 URL，需公网可匿名访问（与 base64 二选一）' },
-              base64: { type: 'string', description: '图片 base64 内容，可带 data:image/png;base64, 前缀（与 url 二选一）' },
-              filename: { type: 'string', description: '文件名（决定扩展名，支持中文），默认 截图N.png' },
-              alt: { type: 'string', description: '图片 alt 描述' },
-            },
-          },
-        },
+        images: imagesSchema('重现步骤'),
       },
       required: ['productID', 'title', 'description', 'assignedTo'],
     },
@@ -878,7 +1069,7 @@ const TOOLS = [
             },
           };
         }
-        const imagesInSteps = uploaded.filter(u => String(bug?.steps ?? '').includes(u.url));
+        const { images: imgs, warnings: imgWarnings } = imageResult(a.images.length, uploaded, failures, String(bug?.steps ?? ''));
         const ob = typeof bug.openedBy === 'object' ? bug.openedBy : { account: bug.openedBy };
         const base = {
           httpStatus: 201,
@@ -889,20 +1080,17 @@ const TOOLS = [
             openedBy: ob.account, openedByRealName: ob.realname ?? '',
             severity: bug.severity, pri: bug.pri, type: bug.type, status: bug.status,
           },
-          images: {
-            requested: a.images.length,
-            uploaded: uploaded.length,
-            embedded: imagesInSteps.length,
-            failed: failures,
-          },
+          images: imgs,
+          ...(imgWarnings.length ? { warnings: imgWarnings } : {}),
           ...notifHint('bug', bug.id, 'assigned', acc),
           note: `openedBy 为当前连接器账号 ${user.account}：禅道以 API 登录账号记录创建人，不允许代他人提交。`,
         };
-        if (failures.length || imagesInSteps.length < uploaded.length) {
+        if (failures.length || imgs.embedded < imgs.uploaded) {
+          // 单图失败不使整体失败（规格六）：对象已创建即 success，失败明细走 images.failed + warnings
           return {
             status: 201,
-            ok: false,
-            data: { ...base, code: 'BUG_CREATED_IMAGE_FAILED', reason: 'Bug 已创建但部分图片未成功内嵌，见 images/failed 与 images/embedded' },
+            ok: true,
+            data: { ...base, code: 'BUG_CREATED_IMAGE_FAILED', reason: 'Bug 已创建，但部分图片未成功内嵌，详见 images.failed 与 warnings' },
           };
         }
         return { status: 201, ok: true, data: base };
@@ -995,19 +1183,9 @@ const TOOLS = [
         severity: { type: 'integer', description: '严重程度 1-4' },
         priority: { type: 'integer', description: '优先级 1-4' },
         type: { type: 'string', description: 'Bug 类型' },
-        images: {
-          type: 'array',
-          description: '要内嵌的截图列表（同 create_bug 的 images 格式）。不传 description 时新图追加到现有步骤末尾的「问题截图」区',
-          items: {
-            type: 'object',
-            properties: {
-              url: { type: 'string', description: '图片 URL，需公网可匿名访问（与 base64 二选一）' },
-              base64: { type: 'string', description: '图片 base64 内容（与 url 二选一）' },
-              filename: { type: 'string', description: '文件名，支持中文' },
-              alt: { type: 'string', description: '图片 alt 描述' },
-            },
-          },
-        },
+        images: Object.assign(imagesSchema('重现步骤'), {
+          description: imagesSchema('重现步骤').description + ' 不传 description 时新图追加到现有步骤末尾的「问题截图」区；传 description 时整段替换重现步骤。',
+        }),
       },
       required: ['id'],
     },
@@ -1047,7 +1225,7 @@ const TOOLS = [
         const wantAssignee = a.assignedTo ?? (typeof curBug.assignedTo === 'object' ? curBug.assignedTo?.account : curBug.assignedTo);
         if (wantAssignee && acc !== wantAssignee) problems.push(`assignedTo 回读为 ${acc ?? 'null'}（期望 ${wantAssignee}）`);
         if (Number(bug?.project) !== Number(curBug.project)) problems.push(`project 回读为 ${bug?.project}（期望 ${curBug.project}）`);
-        const imagesInSteps = uploaded.filter(u => String(bug?.steps ?? '').includes(u.url));
+        const { images: imgs, warnings: imgWarnings } = imageResult(a.images.length, uploaded, failures, String(bug?.steps ?? ''));
         if (problems.length) {
           return {
             status: 500,
@@ -1060,11 +1238,13 @@ const TOOLS = [
           success: true,
           bug: { id: bug.id, title: bug.title, product: bug.product, project: bug.project, execution: bug.execution,
                  assignedTo: acc, assignedToRealName: bug.assignedTo?.realname ?? '', status: bug.status },
-          images: { requested: a.images.length, uploaded: uploaded.length, embedded: imagesInSteps.length, failed: failures },
+          images: imgs,
+          ...(imgWarnings.length ? { warnings: imgWarnings } : {}),
           ...(a.assignedTo && a.assignedTo !== accOf(curBug.assignedTo) ? notifHint('bug', bug.id, 'reassigned', acc) : {}),
         };
-        if (failures.length || imagesInSteps.length < uploaded.length) {
-          return { status: 200, ok: false, data: { ...base, code: 'BUG_CREATED_IMAGE_FAILED', reason: 'Bug 已更新但部分图片未成功内嵌，见 images' } };
+        if (failures.length || imgs.embedded < imgs.uploaded) {
+          // 单图失败不使整体失败（规格六）
+          return { status: 200, ok: true, data: { ...base, code: 'BUG_CREATED_IMAGE_FAILED', reason: 'Bug 已更新，但部分图片未成功内嵌，详见 images.failed 与 warnings' } };
         }
         return { status: 200, ok: true, data: base };
       }
@@ -1215,13 +1395,16 @@ const TOOLS = [
   {
     name: 'create_task',
     title: '创建任务',
-    description: '在执行（迭代）下创建任务，可同时指派负责人。禅道要求必填截止日期 deadline，不传默认今天+7天；estStarted 不传默认今天；任务类型 type：devel 开发 / test 测试 / design 设计 / research 调研 / discussion 讨论',
+    description:
+      '在执行（迭代）下创建任务，可同时指派负责人。禅道要求必填截止日期 deadline，不传默认今天+7天；estStarted 不传默认今天；任务类型 type：devel 开发 / test 测试 / design 设计 / research 调研 / discussion 讨论。' +
+      '支持 images 截图列表：图片真实上传到禅道文件系统并内嵌到任务描述富文本（不是普通附件），打开任务详情即可看到。' +
+      'desc 中用 [截图:1]、[截图:2] 标记指定插入位置；未标记的图统一追加到「问题截图」区（关联需求的任务为「参考截图」区）。',
     inputSchema: {
       type: 'object',
       properties: {
         executionID: { type: 'integer', description: '执行（迭代）ID' },
         name: { type: 'string', description: '任务名称' },
-        desc: { type: 'string', description: '任务描述' },
+        desc: { type: 'string', description: '任务描述（纯文本或 HTML；images 内嵌其中，[截图:1]、[截图:2] 标记指定插入位置）' },
         type: { type: 'string', description: '任务类型，默认 devel' },
         assignedTo: { type: 'string', description: '指派给（禅道账号，非中文姓名）' },
         pri: { type: 'integer', description: '优先级 1-4，默认 3' },
@@ -1229,16 +1412,28 @@ const TOOLS = [
         estStarted: { type: 'string', description: '预计开始日期 YYYY-MM-DD，默认今天' },
         deadline: { type: 'string', description: '截止日期 YYYY-MM-DD，禅道必填；不传默认今天+7天' },
         storyID: { type: 'integer', description: '关联需求 ID（可选）' },
+        images: imagesSchema('任务描述'),
       },
       required: ['executionID', 'name'],
     },
-    run: (env, user, a) =>
-      ztFetch(env, user, `/executions/${a.executionID}/tasks`, {
+    run: async (env, user, a) => {
+      const hasImages = Array.isArray(a.images) && a.images.length > 0;
+      let uploaded = [], failures = [], desc = a.desc ?? a.name;
+      if (hasImages) {
+        ({ uploaded, failures } = await uploadObjectImages(env, user, a.images));
+        const section = a.storyID ? '参考截图' : '问题截图';
+        desc = buildStepsHtml(a.desc ?? a.name, uploaded, section);
+        if (uploaded.length && !/<img\s/i.test(desc)) {
+          // 兜底：[截图:N] 全指向失败图被删除后，已上传的图仍必须落图（规格五：禁止有图不显示）
+          desc = buildStepsHtml(String(a.desc ?? a.name).replace(/\[\s*截图\s*[:：]?\s*\d+\s*\]|\[\s*图\s*[:：]?\s*\d+\s*\]/g, ''), uploaded, section);
+        }
+      }
+      const created = await ztFetch(env, user, `/executions/${a.executionID}/tasks`, {
         method: 'POST',
         body: {
           name: a.name,
           type: a.type ?? 'devel',
-          desc: a.desc ?? a.name,
+          desc,
           pri: a.pri ?? 3,
           estimate: a.estimate ?? 1,
           estStarted: a.estStarted ?? todayCN(),
@@ -1246,12 +1441,45 @@ const TOOLS = [
           assignedTo: a.assignedTo,
           story: a.storyID,
         },
-      }),
+      });
+      if (!created.ok || created.data?.error || created.data?.result === 'fail') {
+        return { status: created.status, ok: false, data: { zentaoError: created.data } };
+      }
+      if (!hasImages) {
+        return { status: created.status, ok: true, data: created.data };
+      }
+      // 图片验收：回读任务，逐图核对 <img src> 真实内嵌（Task desc 走 REST 不剥 <img>，实测保留）
+      const createdId = Number(created.data?.id ?? created.data?.task?.id ?? 0);
+      let task = created.data;
+      if (createdId) {
+        const rb = await ztFetch(env, user, `/tasks/${createdId}`);
+        task = pickObj(rb.data, createdId) ?? created.data;
+      }
+      const { images: imgs, warnings } = imageResult(a.images.length, uploaded, failures, String(task?.desc ?? ''));
+      const base = {
+        httpStatus: created.status,
+        success: true,
+        task: createdId ? actionSummary('task', task) : created.data,
+        images: imgs,
+        ...(warnings.length ? { warnings } : {}),
+      };
+      if (failures.length || imgs.embedded < imgs.uploaded) {
+        // 单图失败不使整体失败（规格六）：任务已创建即 success，失败明细走 images.failed + warnings
+        return {
+          status: created.status,
+          ok: true,
+          data: { ...base, code: 'TASK_CREATED_IMAGE_FAILED', reason: '任务已创建，但部分图片未成功内嵌，详见 images.failed 与 warnings' },
+        };
+      }
+      return { status: created.status, ok: true, data: base };
+    },
   },
   {
     name: 'update_task',
     title: '修改任务',
-    description: '修改任务（指派、截止日期、优先级、描述、预计工时等）',
+    description:
+      '修改任务（指派、截止日期、优先级、描述、预计工时等）。支持 images 截图列表：图片真实上传到禅道文件系统并内嵌到任务描述富文本（不是普通附件）。' +
+      '不传 desc 时新图追加到现有描述末尾的「问题截图/参考截图」区；传 desc 时整段替换描述，[截图:1]、[截图:2] 标记指定插入位置，未标记的图统一追加到截图区。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1259,14 +1487,32 @@ const TOOLS = [
         assignedTo: { type: 'string', description: '指派给（禅道账号）' },
         deadline: { type: 'string', description: '截止日期 YYYY-MM-DD' },
         pri: { type: 'integer', description: '优先级 1-4' },
-        desc: { type: 'string', description: '任务描述' },
+        desc: { type: 'string', description: '任务描述（完整替换；images 内嵌其中，[截图:N] 标记指定插入位置）' },
         estimate: { type: 'number', description: '预计工时（小时）' },
         estStarted: { type: 'string', description: '预计开始日期 YYYY-MM-DD' },
+        images: imagesSchema('任务描述'),
       },
       required: ['id'],
     },
     run: async (env, user, a) => {
-      const { id, ...body } = a;
+      const { id, images, ...body } = a;
+      const hasImages = Array.isArray(images) && images.length > 0;
+      let uploaded = [], failures = [];
+      if (hasImages) {
+        // 追加图语义：不传 desc 时在现有描述上追加；传 desc 时整段替换（images 内嵌其中）
+        const curRes = await ztFetch(env, user, `/tasks/${id}`);
+        const cur = pickObj(curRes.data, id);
+        if (!cur?.id || curRes.data?.error) {
+          return { status: curRes.status, ok: false, data: { error: `任务 ${id} 不存在或无法访问` } };
+        }
+        ({ uploaded, failures } = await uploadObjectImages(env, user, images));
+        const baseDesc = a.desc !== undefined ? a.desc : String(cur.desc ?? '');
+        const section = cur.story ? '参考截图' : '问题截图';
+        body.desc = buildStepsHtml(baseDesc, uploaded, section);
+        if (uploaded.length && !/<img\s/i.test(body.desc)) {
+          body.desc = buildStepsHtml(String(baseDesc).replace(/\[\s*截图\s*[:：]?\s*\d+\s*\]|\[\s*图\s*[:：]?\s*\d+\s*\]/g, ''), uploaded, section);
+        }
+      }
       const res = await ztFetch(env, user, `/tasks/${id}`, { method: 'PUT', body });
       if (!res.ok || res.data?.error || res.data?.result === 'fail') {
         return { status: res.status, ok: false, data: { zentaoError: res.data } };
@@ -1290,7 +1536,26 @@ const TOOLS = [
           },
         };
       }
-      return { status: 200, ok: true, data: { success: true, task: actionSummary('task', task) } };
+      if (!hasImages) {
+        return { status: 200, ok: true, data: { success: true, task: actionSummary('task', task) } };
+      }
+      const { images: imgs, warnings } = imageResult(images.length, uploaded, failures, String(task?.desc ?? ''));
+      const base = {
+        httpStatus: 200,
+        success: true,
+        task: actionSummary('task', task),
+        images: imgs,
+        ...(warnings.length ? { warnings } : {}),
+      };
+      if (failures.length || imgs.embedded < imgs.uploaded) {
+        // 单图失败不使整体失败（规格六）
+        return {
+          status: 200,
+          ok: true,
+          data: { ...base, code: 'TASK_IMAGE_FAILED', reason: '任务已更新，但部分图片未成功内嵌，详见 images.failed 与 warnings' },
+        };
+      }
+      return { status: 200, ok: true, data: base };
     },
   },
   {
@@ -1836,7 +2101,7 @@ async function handleRpc(env, user, msg) {
     return mcpResult(id, {
       protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : API_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.4.4' },
+      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.5.1' },
       instructions:
         '禅道项目管理连接器。指派任务或需求时 assignedTo 必须用禅道账号（英文），先用 list_users 查询账号；' +
         'productID / executionID 可用 list_products / list_executions 查询。创建需求必填 title；创建任务必填 executionID + name。' +
