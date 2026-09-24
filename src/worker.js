@@ -487,9 +487,16 @@ async function uploadObjectImages(env, user, images) {
   for (const item of (images || [])) {
     try {
       const loaded = await loadImageBytes(item, idx);
+      // 禅道 21.7 file-ajaxUpload 按「文件名扩展名」查图片白名单（png/jpg/jpeg/gif/bmp，
+      // 不含 webp）：白名单外一律落 file-read-N.txt + octet-stream（<img> 渲染无保障）。
+      // webp 字节挂 .png 传输名实测落 image/png（2026-09-24 探针），浏览器 <img> 按魔数
+      // 解码照常显示；uploaded[].filename 仍保留用户原始名（展示用）。
+      const isWebp = /\.webp$/i.test(loaded.filename);
+      const transportName = isWebp ? loaded.filename.replace(/\.webp$/i, '.png') : loaded.filename;
+      const transportMime = isWebp ? 'image/png' : loaded.mime;
       let url;
       try {
-        url = await uploadImageWeb(env, user, loaded.bytes, loaded.filename, loaded.mime);
+        url = await uploadImageWeb(env, user, loaded.bytes, transportName, transportMime);
       } catch (upErr) {
         if (!upErr.code) upErr.code = 'UPLOAD_FAILED'; // 登录/网络类异常也归入上传失败，不漏成 UNKNOWN
         throw upErr;
@@ -2101,7 +2108,7 @@ async function handleRpc(env, user, msg) {
     return mcpResult(id, {
       protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : API_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.5.1' },
+      serverInfo: { name: 'zentao-mcp', title: '禅道 ZenTao', version: '1.5.2' },
       instructions:
         '禅道项目管理连接器。指派任务或需求时 assignedTo 必须用禅道账号（英文），先用 list_users 查询账号；' +
         'productID / executionID 可用 list_products / list_executions 查询。创建需求必填 title；创建任务必填 executionID + name。' +
